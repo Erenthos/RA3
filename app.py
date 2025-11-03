@@ -6,18 +6,13 @@ from psycopg2.extras import RealDictCursor
 
 st.set_page_config(page_title="Reverse Auction Platform", layout="wide")
 
-# --- DB CONNECTION ---
+# =========================================================
+# 🔗 DATABASE CONNECTION (uses Streamlit secret NEON_URL)
+# =========================================================
 def get_conn():
-    cfg = st.secrets["database"]
-    return psycopg2.connect(
-        host=cfg["host"],
-        dbname=cfg["dbname"],
-        user=cfg["user"],
-        password=cfg["password"],
-        sslmode=cfg["sslmode"]
-    )
+    conn_str = st.secrets["NEON_URL"]
+    return psycopg2.connect(conn_str)
 
-# --- UTILITY FUNCTION ---
 def execute_query(query, params=None, fetch=False):
     conn = get_conn()
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -27,7 +22,9 @@ def execute_query(query, params=None, fetch=False):
     conn.close()
     return data
 
-# --- AUTHENTICATION ---
+# =========================================================
+# 🧩 AUTHENTICATION
+# =========================================================
 def login(username, password):
     user = execute_query(
         "SELECT * FROM users WHERE username=%s AND password=%s",
@@ -46,7 +43,9 @@ def signup(username, password, role):
         (username, password, role)
     )
 
-# --- AUCTION MANAGEMENT ---
+# =========================================================
+# 🏗️ AUCTION MANAGEMENT
+# =========================================================
 def create_auction(title, base_price, min_dec, duration, buyer_id):
     execute_query("""
         INSERT INTO auctions (title, base_price, min_decrement, current_price, duration_minutes, created_by)
@@ -81,13 +80,13 @@ def get_bids(auction_id):
         ORDER BY b.bid_amount ASC
     """, (auction_id,), fetch=True)
 
-def get_current_price(auction_id):
-    price = execute_query("SELECT current_price FROM auctions WHERE id=%s", (auction_id,), fetch=True)
-    return price[0]['current_price']
-
 def place_bid(auction_id, supplier_id, bid_amount):
     auction = execute_query("SELECT * FROM auctions WHERE id=%s", (auction_id,), fetch=True)[0]
     min_allowed = float(auction['current_price']) - float(auction['min_decrement'])
+
+    if auction['status'] != 'running':
+        st.warning("⚠️ Auction not running.")
+        return False
 
     if bid_amount >= auction['current_price']:
         st.warning("❌ Bid must be lower than current price.")
@@ -103,7 +102,9 @@ def place_bid(auction_id, supplier_id, bid_amount):
     st.success("✅ Bid placed successfully!")
     return True
 
-# --- STREAMLIT UI ---
+# =========================================================
+# 🧭 STREAMLIT APP
+# =========================================================
 def main():
     st.title("💰 Reverse Auction Platform")
 
@@ -112,10 +113,11 @@ def main():
     if "show_signup" not in st.session_state:
         st.session_state.show_signup = False
 
-    # ----------- SIGNUP -----------
+    # ---------------------------------------------------------
+    # SIGNUP SCREEN
+    # ---------------------------------------------------------
     if st.session_state.show_signup:
         st.subheader("🆕 Create a New Account")
-
         username = st.text_input("Choose Username")
         password = st.text_input("Choose Password", type="password")
         role = st.radio("Select Role", ["buyer", "supplier"], horizontal=True)
@@ -124,7 +126,7 @@ def main():
             if not username or not password:
                 st.warning("Please fill all fields.")
             elif user_exists(username):
-                st.error("Username already exists. Try another.")
+                st.error("Username already exists.")
             else:
                 signup(username, password, role)
                 st.success("✅ Account created successfully! You can now log in.")
@@ -136,7 +138,9 @@ def main():
             st.rerun()
         return
 
-    # ----------- LOGIN -----------
+    # ---------------------------------------------------------
+    # LOGIN SCREEN
+    # ---------------------------------------------------------
     if not st.session_state.user:
         st.subheader("🔐 Login to Continue")
         username = st.text_input("Username")
@@ -155,14 +159,18 @@ def main():
             st.rerun()
         return
 
-    # ----------- LOGGED IN USER -----------
+    # ---------------------------------------------------------
+    # DASHBOARDS
+    # ---------------------------------------------------------
     user = st.session_state.user
     st.sidebar.write(f"👤 Logged in as: {user['username']} ({user['role']})")
     if st.sidebar.button("Logout"):
         st.session_state.user = None
         st.rerun()
 
-    # ----------- BUYER DASHBOARD -----------
+    # ---------------------------------------------------------
+    # BUYER DASHBOARD
+    # ---------------------------------------------------------
     if user["role"] == "buyer":
         st.header("🧾 Buyer Dashboard")
 
@@ -185,7 +193,9 @@ def main():
             if a["created_by"] != user["id"]:
                 continue
             with st.container(border=True):
-                st.markdown(f"**{a['title']}** | Base ₹{a['base_price']} | Current ₹{a['current_price']} | Status: {a['status']}")
+                st.markdown(
+                    f"**{a['title']}** | Base ₹{a['base_price']} | Current ₹{a['current_price']} | Status: {a['status']}"
+                )
                 if a["status"] == "not_started":
                     if st.button(f"▶️ Start Auction #{a['id']}", key=f"start{a['id']}"):
                         start_auction(a['id'])
@@ -200,26 +210,39 @@ def main():
                 else:
                     st.info("No bids yet.")
 
-    # ----------- SUPPLIER DASHBOARD -----------
+    # ---------------------------------------------------------
+    # SUPPLIER DASHBOARD
+    # ---------------------------------------------------------
     elif user["role"] == "supplier":
         st.header("🏷 Supplier Dashboard")
         auctions = get_auctions()
         running_auctions = [a for a in auctions if a["status"] == "running"]
 
         if not running_auctions:
-            st.info("No running auctions at the moment.")
+            st.info("No running auctions right now.")
             return
 
         for a in running_auctions:
             with st.container(border=True):
-                st.markdown(f"**{a['title']}** | Current Price: ₹{a['current_price']} | Min Decrement: ₹{a['min_decrement']}")
-                bid = st.number_input(f"Your Bid for Auction #{a['id']}", key=f"bid{a['id']}", min_value=0.0, step=1.0)
+                st.markdown(
+                    f"**{a['title']}** | Current Price: ₹{a['current_price']} | Min Decrement: ₹{a['min_decrement']}"
+                )
+                bid = st.number_input(
+                    f"Your Bid for Auction #{a['id']}",
+                    key=f"bid{a['id']}",
+                    min_value=0.0,
+                    step=1.0,
+                )
                 if st.button(f"💸 Place Bid #{a['id']}", key=f"btn{a['id']}"):
                     place_bid(a['id'], user['id'], bid)
                     st.rerun()
+
                 bids = get_bids(a["id"])
                 if bids:
                     st.dataframe(pd.DataFrame(bids))
 
+# =========================================================
+# 🚀 RUN
+# =========================================================
 if __name__ == "__main__":
     main()
