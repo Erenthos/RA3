@@ -1,337 +1,315 @@
-import streamlit as st
-import pandas as pd
-import psycopg2
+# app.py
+import os
 import time
+import io
 from datetime import datetime, timedelta
+import psycopg2
 from psycopg2.extras import RealDictCursor
+import streamlit as st
+from werkzeug.security import generate_password_hash, check_password_hash
+from fpdf import FPDF
+from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="Reverse Auction Platform", layout="wide")
+# ---------- Configuration ----------
+DATABASE_URL = st.secrets.get('NEON_URL')  # Neon connection string stored in Streamlit Secrets
+if not DATABASE_URL:
+    st.warning('NEON_URL not set in Streamlit Secrets.')
 
-# =========================================================
-# CONFIG: auto-refresh polling interval (seconds)
-# =========================================================
-DEFAULT_REFRESH_INTERVAL = 3
+REFRESH_INTERVAL_MS = 2000  # how often pages auto refresh in ms
 
+# ---------- DB helpers ----------
 
-# =========================================================
-# DATABASE CONNECTION
-# =========================================================
 def get_conn():
-    conn_str = st.secrets["NEON_URL"]
-    return psycopg2.connect(conn_str)
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
 
 
-def execute_query(query, params=None, fetch=False):
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    try:
-        cur.execute(query, params or ())
-        data = cur.fetchall() if fetch else None
-        conn.commit()
-        return data
-    except Exception as e:
-        st.error(f"Database error: {e}")
-        conn.rollback()
+def run_query(query, args=None, fetch=False, commit=False):
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(query, args or ())
+            if commit:
+                conn.commit()
+            if fetch:
+                return cur.fetchall()
+
+# ---------- Auth ----------
+
+def create_user(username, password, role='supplier'):
+    pw_hash = generate_password_hash(password)
+    run_query(
+        "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s)",
+        (username, pw_hash, role), commit=True
+    )
+
+
+def authenticate(username, password):
+    rows = run_query("SELECT * FROM users WHERE username=%s", (username,), fetch=True)
+    if not rows:
         return None
-    finally:
-        conn.close()
+    user = rows[0]
+    if check_password_hash(user['password_hash'], password):
+        return dict(id=user['id'], username=user['username'], role=user['role'])
+    return None
 
+# ---------- Auction logic ----------
 
-# =========================================================
-# AUTHENTICATION
-# =========================================================
-def login(username, password):
-    result = execute_query(
-        "SELECT * FROM users WHERE username=%s AND password=%s",
-        (username, password),
-        fetch=True,
+def create_auction(buyer_id, title, decrement_step, duration_minutes, start_price):
+    now = datetime.utcnow()
+    end_time = now + timedelta(minutes=duration_minutes)
+    row = run_query(
+        "INSERT INTO auctions (buyer_id, title, decrement_step, duration_minutes, start_price, start_time, end_time, status) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        (buyer_id, title, decrement_step, duration_minutes, start_price, now, end_time, 'SCHEDULED'), fetch=True, commit=True
     )
-    return result[0] if result else None
+    return row[0]['id']
 
 
-def user_exists(username):
-    result = execute_query("SELECT id FROM users WHERE username=%s", (username,), fetch=True)
-    return bool(result)
-
-
-def signup(username, password, role):
-    execute_query(
-        "INSERT INTO users (username, password, role) VALUES (%s, %s, %s)",
-        (username, password, role),
+def add_item(auction_id, description, quantity, uom):
+    run_query(
+        "INSERT INTO items (auction_id, description, quantity, uom) VALUES (%s,%s,%s,%s)",
+        (auction_id, description, quantity, uom), commit=True
     )
-
-
-# =========================================================
-# AUCTION LOGIC
-# =========================================================
-def create_auction(title, base_price, min_dec, duration_minutes, buyer_id):
-    execute_query(
-        """
-        INSERT INTO auctions (title, base_price, min_decrement, current_price, duration_minutes, created_by)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        """,
-        (title, base_price, min_dec, base_price, duration_minutes, buyer_id),
-    )
-
-
-def get_auctions():
-    rows = execute_query("SELECT * FROM auctions ORDER BY id DESC", fetch=True)
-    return rows or []
-
-
-def get_duration(auction_id):
-    r = execute_query(
-        "SELECT duration_minutes FROM auctions WHERE id=%s", (auction_id,), fetch=True
-    )
-    return int(r[0]["duration_minutes"]) if r else 0
 
 
 def start_auction(auction_id):
-    start = datetime.now()
-    end = start + timedelta(minutes=get_duration(auction_id))
-    execute_query(
-        """
-        UPDATE auctions
-        SET status='running', start_time=%s, end_time=%s
-        WHERE id=%s
-        """,
-        (start, end, auction_id),
-    )
+    now = datetime.utcnow()
+    run_query("UPDATE auctions SET status='LIVE', start_time=%s WHERE id=%s", (now, auction_id), commit=True)
+    row = run_query("SELECT duration_minutes FROM auctions WHERE id=%s", (auction_id,), fetch=True)
+    if row:
+        end_time = now + timedelta(minutes=row[0]['duration_minutes'])
+        run_query("UPDATE auctions SET end_time=%s WHERE id=%s", (end_time, auction_id), commit=True)
 
 
-def stop_auction(auction_id):
-    execute_query("UPDATE auctions SET status='ended' WHERE id=%s", (auction_id,))
-
-
-def get_bids(auction_id):
-    rows = execute_query(
-        """
-        SELECT b.id, u.username AS supplier, b.bid_amount, b.bid_time
-        FROM bids b
-        JOIN users u ON u.id = b.supplier_id
-        WHERE b.auction_id=%s
-        ORDER BY b.bid_amount ASC, b.bid_time ASC
-        """,
-        (auction_id,),
-        fetch=True,
-    )
-    return rows or []
-
-
-def place_bid(auction_id, supplier_id, bid_amount):
-    auction_rows = execute_query(
-        "SELECT * FROM auctions WHERE id=%s", (auction_id,), fetch=True
-    )
-    if not auction_rows:
-        st.warning("Auction not found.")
-        return False
-    auction = auction_rows[0]
-
-    if auction.get("status") != "running":
-        st.warning("⚠️ Auction not running.")
-        return False
-
-    current_price = float(auction["current_price"])
-    min_dec = float(auction["min_decrement"])
-    min_allowed = current_price - min_dec
-
-    if bid_amount >= current_price:
-        st.warning("❌ Bid must be lower than current price.")
-        return False
-    if bid_amount > min_allowed:
-        st.warning(f"⚠️ Minimum decrement is {min_dec}. You must bid ≤ {min_allowed:.2f}")
-        return False
-
-    execute_query(
-        "INSERT INTO bids (auction_id, supplier_id, bid_amount) VALUES (%s, %s, %s)",
-        (auction_id, supplier_id, bid_amount),
-    )
-    execute_query("UPDATE auctions SET current_price=%s WHERE id=%s", (bid_amount, auction_id))
-    st.success("✅ Bid placed successfully!")
-    return True
-
-
-# =========================================================
-# AUTO-REFRESH POLLING
-# =========================================================
-def maybe_autorefresh():
-    """Polls DB every N seconds using st.rerun()"""
-    if "auto_refresh_enabled" not in st.session_state:
-        st.session_state.auto_refresh_enabled = True
-    if "refresh_interval" not in st.session_state:
-        st.session_state.refresh_interval = DEFAULT_REFRESH_INTERVAL
-    if "last_refresh" not in st.session_state:
-        st.session_state.last_refresh = time.time()
-
-    if not st.session_state.auto_refresh_enabled:
+def close_if_expired(auction_id):
+    now = datetime.utcnow()
+    row = run_query("SELECT end_time, status FROM auctions WHERE id=%s", (auction_id,), fetch=True)
+    if not row:
         return
-
-    now = time.time()
-    interval = float(st.session_state.refresh_interval)
-    if interval <= 0:
-        return
-
-    if now - st.session_state.last_refresh >= interval:
-        st.session_state.last_refresh = now
-        st.rerun()
+    end_time = row[0]['end_time']
+    status = row[0]['status']
+    if status == 'LIVE' and end_time and now >= end_time:
+        run_query("UPDATE auctions SET status='CLOSED' WHERE id=%s", (auction_id,), commit=True)
 
 
-# =========================================================
-# MAIN APP
-# =========================================================
-def main():
-    st.title("💰 Reverse Auction Platform")
-
-    # Sidebar: Live refresh settings
-    st.sidebar.header("🔄 Live Refresh Settings")
-    st.session_state.auto_refresh_enabled = st.sidebar.checkbox(
-        "Enable Auto-Refresh", value=st.session_state.get("auto_refresh_enabled", True)
+def place_bid(supplier_id, item_id, bid_value):
+    row = run_query(
+        "SELECT a.decrement_step, a.status, COALESCE((SELECT MIN(b.bid_value) FROM bids b WHERE b.item_id=%s), i.start_price) as current_min, i.auction_id FROM items i JOIN auctions a ON i.auction_id=a.id WHERE i.id=%s",
+        (item_id, item_id), fetch=True
     )
-    st.session_state.refresh_interval = st.sidebar.number_input(
-        "Refresh Interval (sec)",
-        min_value=1,
-        value=int(st.session_state.get("refresh_interval", DEFAULT_REFRESH_INTERVAL)),
-        step=1,
-    )
+    if not row:
+        return False, 'Invalid item'
+    data = row[0]
+    if data['status'] != 'LIVE':
+        return False, 'Auction is not live'
 
-    # ----------------------------
-    # LOGIN / SIGNUP SCREENS
-    # ----------------------------
-    if "user" not in st.session_state:
-        st.session_state.user = None
-    if "show_signup" not in st.session_state:
-        st.session_state.show_signup = False
+    decrement = data['decrement_step']
+    current_min = data['current_min'] if data['current_min'] is not None else data.get('start_price')
+    if current_min is None:
+        auction_row = run_query("SELECT start_price FROM auctions WHERE id=%s", (data['auction_id'],), fetch=True)
+        current_min = auction_row[0]['start_price'] if auction_row else None
 
-    # --- Signup ---
-    if st.session_state.show_signup:
-        st.subheader("🆕 Create Account")
-        username = st.text_input("Choose Username")
-        password = st.text_input("Choose Password", type="password")
-        role = st.radio("Select Role", ["buyer", "supplier"], horizontal=True)
-        if st.button("Sign Up"):
-            if not username or not password:
-                st.warning("Please fill all fields.")
-            elif user_exists(username):
-                st.error("Username already exists.")
-            else:
-                signup(username, password, role)
-                st.success("✅ Account created! You can now log in.")
-                st.session_state.show_signup = False
-                st.rerun()
+    if current_min is None:
+        return False, 'Cannot determine current price'
 
-        if st.button("🔙 Back to Login"):
-            st.session_state.show_signup = False
-            st.rerun()
-        return
+    diff = current_min - bid_value
+    if diff <= 0:
+        return False, 'Bid must be less than current minimum (reverse auction)'
+    if diff < decrement:
+        return False, f'Bid must reduce price by at least the decrement step ({decrement})'
+    if (diff % decrement) != 0:
+        return False, f'Bid decrease must be in multiples of {decrement}'
 
-    # --- Login ---
-    if not st.session_state.user:
-        st.subheader("🔐 Login to Continue")
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        if st.button("Login"):
-            user = login(username, password)
-            if user:
-                st.session_state.user = user
-                st.success(f"Welcome {user['username']} ({user['role']})")
-                st.rerun()
-            else:
-                st.error("Invalid credentials.")
-        st.write("Don't have an account?")
-        if st.button("📝 Sign Up"):
-            st.session_state.show_signup = True
-            st.rerun()
-        return
+    run_query("INSERT INTO bids (item_id, supplier_id, bid_value, bid_time) VALUES (%s,%s,%s,%s)", (item_id, supplier_id, bid_value, datetime.utcnow()), commit=True)
+    return True, 'Bid placed'
 
-    # --- Logged-in user ---
-    user = st.session_state.user
-    st.sidebar.write(f"👤 Logged in as: {user['username']} ({user['role']})")
-    if st.sidebar.button("Logout"):
-        st.session_state.user = None
-        st.rerun()
 
-    # Run auto-refresh logic each cycle
-    maybe_autorefresh()
+def get_items(auction_id):
+    return run_query("SELECT i.*, COALESCE((SELECT MIN(b.bid_value) FROM bids b WHERE b.item_id=i.id), a.start_price) as current_min FROM items i JOIN auctions a ON i.auction_id=a.id WHERE i.auction_id=%s", (auction_id,), fetch=True)
 
-    # =========================================================
-    # BUYER DASHBOARD
-    # =========================================================
-    if user["role"] == "buyer":
-        st.header("🧾 Buyer Dashboard")
 
-        with st.expander("➕ Create New Auction", expanded=True):
-            title = st.text_input("Auction Title")
-            base_price = st.number_input("Base Price", min_value=0.0, step=100.0)
-            min_dec = st.number_input("Minimum Bid Decrement (X)", min_value=1.0, step=1.0)
-            duration = st.number_input("Auction Duration (Y minutes)", min_value=1, step=1)
-            if st.button("Create Auction"):
-                if not title:
-                    st.warning("Please provide a title.")
-                else:
-                    create_auction(title, base_price, min_dec, duration, user["id"])
-                    st.success("✅ Auction created successfully!")
+def get_bids_for_auction(auction_id):
+    return run_query("SELECT b.*, u.username as supplier_name, i.description FROM bids b JOIN users u ON b.supplier_id=u.id JOIN items i ON b.item_id=i.id WHERE i.auction_id=%s ORDER BY b.bid_time DESC", (auction_id,), fetch=True)
+
+
+def get_auctions_by_buyer(buyer_id):
+    return run_query("SELECT * FROM auctions WHERE buyer_id=%s ORDER BY id DESC", (buyer_id,), fetch=True)
+
+
+def get_live_auctions():
+    now = datetime.utcnow()
+    return run_query("SELECT * FROM auctions WHERE status='LIVE' ORDER BY id DESC", fetch=True)
+
+# ---------- PDF generation ----------
+
+def generate_pdf_summary(auction_id):
+    items = run_query("SELECT i.id, i.description, i.quantity, i.uom, a.title FROM items i JOIN auctions a ON i.auction_id=a.id WHERE i.auction_id=%s", (auction_id,), fetch=True)
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font('Arial', 'B', 14)
+    pdf.cell(0, 10, f'Auction Summary: {items[0]["title"] if items else auction_id}', ln=True)
+    pdf.ln(4)
+    pdf.set_font('Arial', '', 12)
+    for item in items:
+        winner = run_query("SELECT b.bid_value, u.username FROM bids b JOIN users u ON b.supplier_id=u.id WHERE b.item_id=%s ORDER BY b.bid_value ASC LIMIT 1", (item['id'],), fetch=True)
+        if winner:
+            bid_value = winner[0]['bid_value']
+            supplier = winner[0]['username']
+        else:
+            bid_value = 'No bids'
+            supplier = 'N/A'
+        pdf.multi_cell(0, 8, f"Item: {item['description']} | Qty: {item['quantity']} {item['uom']} | Winner: {supplier} | Price: {bid_value}")
+        pdf.ln(1)
+
+    return pdf.output(dest='S').encode('latin-1')
+
+# ---------- Streamlit UI ----------
+
+st.set_page_config(page_title='Reverse Auction (Neon + Streamlit)', layout='wide')
+
+if 'user' not in st.session_state:
+    st.session_state.user = None
+
+st_autorefresh(interval=REFRESH_INTERVAL_MS, key="autorefresh")
+
+st.title('Reverse Auction Platform')
+
+menu = st.sidebar.selectbox('Go to', ['Home', 'Buyer', 'Supplier', 'Admin (dev)'])
+
+if menu == 'Home':
+    st.markdown('Welcome. Use the sidebar to login as Buyer or Supplier.')
+
+# ---------- Buyer Page ----------
+if menu == 'Buyer':
+    st.header('Buyer Portal')
+    if st.session_state.user and st.session_state.user['role'] == 'buyer':
+        st.success(f"Logged in as {st.session_state.user['username']}")
+    else:
+        with st.form('buyer_login'):
+            buser = st.text_input('Username')
+            bpw = st.text_input('Password', type='password')
+            submitted = st.form_submit_button('Login')
+            if submitted:
+                user = authenticate(buser, bpw)
+                if user and user['role'] == 'buyer':
+                    st.session_state.user = user
                     st.rerun()
+                else:
+                    st.error('Invalid buyer credentials')
 
-        auctions = get_auctions()
-        st.subheader("📦 Your Auctions")
+    if st.session_state.user and st.session_state.user['role'] == 'buyer':
+        st.subheader('Create Auction')
+        with st.form('create_auction_form'):
+            title = st.text_input('Auction Title')
+            decrement_step = st.number_input('Minimum decrement step (X)', min_value=1, value=1)
+            duration_minutes = st.number_input('Duration (minutes)', min_value=1, value=10)
+            start_price = st.number_input('Start price (per item)', min_value=0.0, value=1000.0)
+            items_text = st.text_area('Items (one per line: description,qty,uom)\nExample: Solar Cable 4mm,100,MTR')
+            create_submit = st.form_submit_button('Create Auction')
+            if create_submit:
+                auction_id = create_auction(st.session_state.user['id'], title, decrement_step, duration_minutes, start_price)
+                for line in items_text.splitlines():
+                    if not line.strip():
+                        continue
+                    parts = [p.strip() for p in line.split(',')]
+                    desc = parts[0]
+                    qty = float(parts[1]) if len(parts) > 1 else 1
+                    uom = parts[2] if len(parts) > 2 else 'NOS'
+                    add_item(auction_id, desc, qty, uom)
+                st.success(f'Auction {auction_id} created successfully.')
+
+        st.subheader('Your Auctions')
+        auctions = get_auctions_by_buyer(st.session_state.user['id'])
         for a in auctions:
-            if a["created_by"] != user["id"]:
-                continue
-            with st.container(border=True):
-                st.markdown(
-                    f"**{a['title']}** | Base ₹{a['base_price']} | Current ₹{a['current_price']} | "
-                    f"Status: {a['status']}"
-                )
-                if a["status"] == "not_started":
-                    if st.button(f"▶️ Start Auction #{a['id']}", key=f"start{a['id']}"):
-                        start_auction(a["id"])
-                        st.rerun()
-                elif a["status"] == "running":
-                    if st.button(f"⏹ Stop Auction #{a['id']}", key=f"stop{a['id']}"):
-                        stop_auction(a["id"])
-                        st.rerun()
+            st.markdown(f"**Auction {a['id']} — {a['title']}**  — Status: {a['status']}")
+            cols = st.columns(3)
+            with cols[0]:
+                if st.button('Start Auction', key=f'start_{a['id']}'):
+                    start_auction(a['id'])
+                    st.success('Auction started')
+            with cols[1]:
+                if st.button('View Live Status', key=f'view_{a['id']}'):
+                    st.session_state.view_auction = a['id']
+            with cols[2]:
+                if st.button('Download Summary PDF', key=f'pdf_{a['id']}'):
+                    pdf_bytes = generate_pdf_summary(a['id'])
+                    st.download_button('Download PDF', data=pdf_bytes, file_name=f'auction_{a['id']}_summary.pdf', mime='application/pdf')
 
-                bids = get_bids(a["id"])
-                if bids:
-                    st.dataframe(pd.DataFrame(bids))
+        if 'view_auction' in st.session_state:
+            aid = st.session_state.view_auction
+            close_if_expired(aid)
+            st.markdown('---')
+            st.subheader(f'Live Auction View — {aid}')
+            bids = get_bids_for_auction(aid)
+            st.table(bids)
+
+# ---------- Supplier Page ----------
+if menu == 'Supplier':
+    st.header('Supplier Portal')
+    if not (st.session_state.user and st.session_state.user['role'] == 'supplier'):
+        with st.form('supplier_login'):
+            suser = st.text_input('Username')
+            spw = st.text_input('Password', type='password')
+            register = st.checkbox('Register new account')
+            submit = st.form_submit_button('Proceed')
+            if submit:
+                if register:
+                    try:
+                        create_user(suser, spw, role='supplier')
+                        st.success('Supplier created. Please login.')
+                    except Exception as e:
+                        st.error(f'Unable to create user: {e}')
                 else:
-                    st.info("No bids yet.")
+                    user = authenticate(suser, spw)
+                    if user and user['role'] == 'supplier':
+                        st.session_state.user = user
+                        st.rerun()
+                    else:
+                        st.error('Invalid supplier credentials')
 
-    # =========================================================
-    # SUPPLIER DASHBOARD
-    # =========================================================
-    elif user["role"] == "supplier":
-        st.header("🏷 Supplier Dashboard")
-        auctions = get_auctions()
-        running_auctions = [a for a in auctions if a["status"] == "running"]
+    if st.session_state.user and st.session_state.user['role'] == 'supplier':
+        st.success(f"Logged in as {st.session_state.user['username']}")
+        st.subheader('Live Auctions')
+        live = get_live_auctions()
+        for a in live:
+            st.markdown(f"**Auction {a['id']} — {a['title']}**")
+            items = get_items(a['id'])
+            for it in items:
+                st.write(f"Item {it['id']}: {it['description']} | Qty: {it['quantity']} {it['uom']} | Current Min: {it['current_min']}")
+            st.markdown('---')
+            with st.form(f'bid_form_{a['id']}'):
+                st.write('Place bids (leave blank to skip an item)')
+                bid_inputs = {}
+                for it in items:
+                    bid_inputs[it['id']] = st.number_input(f"Bid for Item {it['id']} ({it['description']})", min_value=0.0, value=0.0, key=f"bid_{a['id']}_{it['id']}")
+                submit_bids = st.form_submit_button('Submit Bids')
+                if submit_bids:
+                    placed = 0
+                    for iid, val in bid_inputs.items():
+                        if val and val > 0:
+                            ok, msg = place_bid(st.session_state.user['id'], iid, val)
+                            if ok:
+                                placed += 1
+                            else:
+                                st.error(f'Item {iid}: {msg}')
+                    st.success(f'Placed {placed} bids')
 
-        if not running_auctions:
-            st.info("No running auctions right now.")
-            return
+# ---------- Admin (dev) ----------
+if menu == 'Admin (dev)':
+    st.header('Admin / Dev')
+    st.subheader('Create default admin user')
+    if st.button('Create admin'):
+        try:
+            create_user('admin', 'adminpass', role='buyer')
+            st.success('Admin created')
+        except Exception as e:
+            st.error(f'Error creating admin: {e}')
 
-        for a in running_auctions:
-            with st.container(border=True):
-                st.markdown(
-                    f"**{a['title']}** | Current Price: ₹{a['current_price']} | "
-                    f"Min Decrement: ₹{a['min_decrement']}"
-                )
-                bid = st.number_input(
-                    f"Your Bid for Auction #{a['id']}",
-                    key=f"bid{a['id']}",
-                    min_value=0.0,
-                    step=1.0,
-                )
-                if st.button(f"💸 Place Bid #{a['id']}", key=f"btn{a['id']}"):
-                    place_bid(a["id"], user["id"], bid)
-                    st.rerun()
-
-                bids = get_bids(a["id"])
-                if bids:
-                    st.dataframe(pd.DataFrame(bids))
-
-
-# =========================================================
-# RUN
-# =========================================================
-if __name__ == "__main__":
-    main()
+    st.subheader('DB Quick View')
+    try:
+        st.write('Auctions:')
+        st.table(run_query('SELECT * FROM auctions', fetch=True) or [])
+        st.write('Items:')
+        st.table(run_query('SELECT * FROM items', fetch=True) or [])
+        st.write('Bids:')
+        st.table(run_query('SELECT * FROM bids', fetch=True) or [])
+    except Exception as e:
+        st.error(f'Unable to read DB: {e}')
